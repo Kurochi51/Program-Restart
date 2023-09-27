@@ -1,8 +1,9 @@
 use std::{io, thread};
+use std::io::BufRead;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, mpsc, Mutex};
 use std::time::Duration;
-
+use std::path::MAIN_SEPARATOR;
 use tasklist;
 
 fn main() {
@@ -10,17 +11,32 @@ fn main() {
     println!("Enter the name of the process you want to search for:");
     let name = get_user_input();
     let process_name = format!("{}.exe", name.trim());
-    let app = process_name.clone();
+    let mut app = String::new();
+    if let Some(process_location) = find_process_by_name(&process_name) {
+        let location = process_location.as_str();
+
+        if let Some(last_separator_index) = location.rfind(MAIN_SEPARATOR) {
+            let result = &location[(last_separator_index + 1)..];
+            app = result.to_string();
+        }
+    } else {
+        println!("Process not found.");
+        return;
+    }
 
     // Prompt the user to input the restart interval.
+    let restart_interval_hours: u64;
     println!("Enter the restart interval in hours:");
-    let restart_interval_hours = match get_user_input().parse::<u64>() {
-        Ok(num) => num,
-        Err(_) => {
-            println!("Invalid input. Please enter a valid number.");
-            return;
-        }
-    };
+    loop {
+        match get_user_input().parse::<u64>()
+        {
+            Ok(input) => {
+                restart_interval_hours = input;
+                break;
+            }
+            Err(_) => println!("Invalid input. Please enter a valid number."),
+        };
+    }
 
     // Create a signal to stop the monitoring thread.
     let exit_signal = Arc::new((Mutex::new(false), Condvar::new()));
@@ -51,28 +67,46 @@ fn main() {
                         }
                     }
             } else {
-                eprintln!("Process {} not found. Exiting.", process_name);
+                eprintln!("Process {} not found. Exiting...", process_name);
                 break;
             }
         }
+        let (lock, cvar) = &*exit_signal_clone;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
     });
 
     println!("Application: {}", app);
     println!("1. Exit");
-    // Wait for the user's input.
     loop {
-        let user_choice = get_user_input();
-        match user_choice.trim().as_ref() {
-            "1" => {
-                // Set the exit signal to stop the monitor_thread.
-                let (lock, cvar) = &*exit_signal;
-                *lock.lock().unwrap() = true;
-                cvar.notify_all();
-                break;
-            }
-            _ => {
-                println!("Invalid option. Please select a valid option.");
-            }
+        let (lock, _cvar) = &*exit_signal;
+        let monitoring_thread_exited = *lock.lock().unwrap();
+
+        if monitoring_thread_exited {
+            break;
+        }
+        let timeout_duration = Duration::from_millis(2000);
+        let input = get_user_input_with_timeout(timeout_duration);
+        match input
+        {
+            Some(string) =>
+                {
+                    match string.trim()
+                    {
+                        "1" => {
+                            let (lock, cvar) = &*exit_signal;
+                            *lock.lock().unwrap() = true;
+                            cvar.notify_all();
+                            println!("Exiting program.");
+                            break;
+                        }
+                        _ => {
+                            println!("Invalid option {}. Please select a valid option.", string.trim());
+                            println!("1. Exit");
+                        }
+                    }
+                }
+            None => continue
         }
     }
 
@@ -82,13 +116,32 @@ fn main() {
     }
 }
 
-
 fn get_user_input() -> String {
     let mut input = String::new();
     io::stdin()
         .read_line(&mut input)
         .expect("Failed to read input");
     input.trim().to_string()
+}
+
+fn get_user_input_with_timeout(timeout: Duration) -> Option<String> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut input = String::new();
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+
+        if handle.read_line(&mut input).is_ok() {
+            tx.send(input.trim().to_string()).ok();
+        }
+    })
+        .join().expect("Error in input thread joining");
+    let result = rx.recv_timeout(timeout);
+    match result
+    {
+        Err(_) => None,
+        Ok(input) => Some(input)
+    }
 }
 
 fn find_process_by_name(process_name: &str) -> Option<String> {
@@ -108,7 +161,8 @@ unsafe fn restart_process(executable_path: &str, process_name: &str) -> Result<(
     let pid = find_pid(process_name);
 
     if pid == 0 {
-        return Err("Error in finding the Process ID".to_string());
+        let message = format!("Program {} isn't running.",process_name);
+        return Err(message);
     }
 
     let kill_command = format!("taskkill /F /PID {}", pid);
@@ -116,6 +170,7 @@ unsafe fn restart_process(executable_path: &str, process_name: &str) -> Result<(
     match Command::new("cmd")
         .arg("/C")
         .arg(&kill_command)
+        .stdout(Stdio::null())
         .status()
     {
         Ok(status) => {
