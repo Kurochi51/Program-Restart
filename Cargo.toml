@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+chrono = "0.4.31"
 tasklist = "0.2.12"
+term_cursor = "0.2.1"
+tokio = { version = "1", features = ["full"] }
